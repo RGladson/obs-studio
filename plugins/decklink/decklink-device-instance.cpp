@@ -679,6 +679,19 @@ void DeckLinkDeviceInstance::WriteAudio(audio_data *frames)
 {
 	uint32_t sampleFramesWritten;
 	output->ScheduleAudioSamples(frames->data[0], frames->frames, 0, 0, &sampleFramesWritten);
+
+	/* Telemetry only: continuous-mode audio has no queue-depth management,
+	 * so clock skew between the OBS audio thread and the card accumulates
+	 * here as standing delay. Log the depth once a minute to make that
+	 * drift visible. Output is always 48 kHz (EnableAudioOutput above). */
+	const uint64_t now = os_gettime_ns();
+	if (now - lastBufferLogNs >= 60000000000ULL) {
+		lastBufferLogNs = now;
+		uint32_t buffered = 0;
+		if (SUCCEEDED(output->GetBufferedAudioSampleFrameCount(&buffered)))
+			LOG(LOG_INFO, "output audio buffer: %u samples (%.1f ms)", (unsigned)buffered,
+			    (double)buffered * 1000.0 / 48000.0);
+	}
 }
 
 #define TIME_BASE 1000000000
