@@ -11,6 +11,8 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
 
 #include "OBSVideoFrame.h"
 
@@ -546,6 +548,9 @@ bool DeckLinkDeviceInstance::StartOutput(DeckLinkDeviceMode *mode_)
 
 	LOG(LOG_INFO, "Starting output...");
 
+	LOG(LOG_INFO, "[trickle] audio steering patch v1.0 (base 32.2.2 + PR#11398)");
+	LoadTrickleConfig();
+
 	ComPtr<IDeckLinkOutput> output_;
 	if (!device->GetOutput(&output_)) {
 		return false;
@@ -557,8 +562,10 @@ bool DeckLinkDeviceInstance::StartOutput(DeckLinkDeviceMode *mode_)
 		return false;
 	}
 
+	/* PR #11398: WriteAudioSamplesSync must not be used during scheduled
+	 * playback; use a continuous stream fed by ScheduleAudioSamples. */
 	const HRESULT audioResult = output_->EnableAudioOutput(bmdAudioSampleRate48kHz, bmdAudioSampleType16bitInteger,
-							       2, bmdAudioOutputStreamTimestamped);
+							       2, bmdAudioOutputStreamContinuous);
 	if (audioResult != S_OK) {
 		LOG(LOG_ERROR, "Failed to enable audio output");
 		return false;
@@ -694,10 +701,140 @@ void DeckLinkDeviceInstance::ScheduleVideoFrame(IDeckLinkVideoFrame *frame)
 	}
 }
 
+void DeckLinkDeviceInstance::LoadTrickleConfig()
+{
+	trickleCfg = TrickleConfig();
+	trickleLevel = -1.0;
+	trickleInserted = 0;
+	trickleDropped = 0;
+	tricklePrimed = false;
+
+	char *path = obs_module_config_path("trickle.ini");
+	if (!path)
+		return;
+
+	FILE *f = os_fopen(path, "rb");
+	if (!f) {
+		/* first run: write a commented template so the knobs are
+		 * discoverable; values load on every output (re)start */
+		char *dir = obs_module_config_path("");
+		if (dir) {
+			os_mkdirs(dir);
+			bfree(dir);
+		}
+		f = os_fopen(path, "wb");
+		if (f) {
+			fputs("; DeckLink output audio trickle steering (custom patch)\n"
+			      "; Edit values, then restart the DeckLink output (not OBS) to apply.\n"
+			      "enabled=1\n"
+			      "; buffer level to hold = audio latency, in ms (30-500)\n"
+			      "target_ms=100\n"
+			      "; leave the level alone while within this band of the target, in ms\n"
+			      "deadband_ms=2\n"
+			      "; max sample frames inserted/dropped per audio callback (1-16, ~47 callbacks/s)\n"
+			      "max_correction=1\n"
+			      "; smoothing factor for the level reading (0.01-1.0)\n"
+			      "ema_alpha=0.05\n"
+			      "; log the level every N seconds, 0 = off\n"
+			      "log_interval_sec=60\n",
+			      f);
+			fclose(f);
+			LOG(LOG_INFO, "[trickle] wrote default config: %s", path);
+		}
+		bfree(path);
+		return;
+	}
+
+	char line[256];
+	double v;
+	while (fgets(line, sizeof(line), f)) {
+		if (sscanf(line, " enabled = %lf", &v) == 1)
+			trickleCfg.enabled = v != 0.0;
+		else if (sscanf(line, " target_ms = %lf", &v) == 1)
+			trickleCfg.targetMs = std::min(std::max(v, 30.0), 500.0);
+		else if (sscanf(line, " deadband_ms = %lf", &v) == 1)
+			trickleCfg.deadbandMs = std::min(std::max(v, 0.25), 50.0);
+		else if (sscanf(line, " max_correction = %lf", &v) == 1)
+			trickleCfg.maxCorrectionSamples = (int)std::min(std::max(v, 0.0), 16.0);
+		else if (sscanf(line, " ema_alpha = %lf", &v) == 1)
+			trickleCfg.emaAlpha = std::min(std::max(v, 0.01), 1.0);
+		else if (sscanf(line, " log_interval_sec = %lf", &v) == 1)
+			trickleCfg.logIntervalSec = (int)std::min(std::max(v, 0.0), 3600.0);
+	}
+	fclose(f);
+
+	LOG(LOG_INFO,
+	    "[trickle] config %s: enabled=%d target=%.1fms deadband=%.2fms max_correction=%d ema_alpha=%.3f log=%ds",
+	    path, (int)trickleCfg.enabled, trickleCfg.targetMs, trickleCfg.deadbandMs, trickleCfg.maxCorrectionSamples,
+	    trickleCfg.emaAlpha, trickleCfg.logIntervalSec);
+	bfree(path);
+}
+
 void DeckLinkDeviceInstance::WriteAudio(audio_data *frames)
 {
 	uint32_t sampleFramesWritten;
-	output->WriteAudioSamplesSync(frames->data[0], frames->frames, &sampleFramesWritten);
+
+	if (!trickleCfg.enabled) {
+		output->ScheduleAudioSamples(frames->data[0], frames->frames, 0, 0, &sampleFramesWritten);
+		return;
+	}
+
+	/* 16-bit stereo, matching EnableAudioOutput() above */
+	const uint32_t kBytesPerFrame = 4;
+	const double targetFrames = trickleCfg.targetMs * 48.0;
+	const double deadbandFrames = trickleCfg.deadbandMs * 48.0;
+
+	uint32_t buffered = 0;
+	const bool haveLevel = output->GetBufferedAudioSampleFrameCount(&buffered) == S_OK;
+
+	if (haveLevel && !tricklePrimed) {
+		/* one-shot prime: top the buffer up to the target with silence
+		 * before the first real samples play (inaudible at startup) */
+		if ((double)buffered < targetFrames) {
+			const uint32_t missing = (uint32_t)(targetFrames - (double)buffered);
+			std::vector<uint8_t> silence((size_t)missing * kBytesPerFrame, 0);
+			output->ScheduleAudioSamples(silence.data(), missing, 0, 0, &sampleFramesWritten);
+		}
+		trickleLevel = targetFrames;
+		tricklePrimed = true;
+		trickleLastLogNs = os_gettime_ns();
+		LOG(LOG_INFO, "[trickle] primed audio buffer to %.1f ms (driver had %.1f ms)", trickleCfg.targetMs,
+		    (double)buffered / 48.0);
+	} else if (haveLevel) {
+		trickleLevel += trickleCfg.emaAlpha * ((double)buffered - trickleLevel);
+
+		const double err = trickleLevel - targetFrames;
+		uint32_t n = (uint32_t)trickleCfg.maxCorrectionSamples;
+		if (n > 16)
+			n = 16;
+
+		if (n > 0 && err < -deadbandFrames) {
+			/* level low: insert duplicates of the first sample frame */
+			uint8_t dup[16 * 4];
+			for (uint32_t i = 0; i < n; i++)
+				memcpy(dup + (size_t)i * kBytesPerFrame, frames->data[0], kBytesPerFrame);
+			output->ScheduleAudioSamples(dup, n, 0, 0, &sampleFramesWritten);
+			trickleInserted += n;
+			trickleLevel += n;
+		} else if (n > 0 && err > deadbandFrames && frames->frames > n) {
+			/* level high: drop the first sample frame(s) of this chunk */
+			frames->data[0] += (size_t)n * kBytesPerFrame;
+			frames->frames -= n;
+			trickleDropped += n;
+		}
+	}
+
+	output->ScheduleAudioSamples(frames->data[0], frames->frames, 0, 0, &sampleFramesWritten);
+
+	if (trickleCfg.logIntervalSec > 0) {
+		const uint64_t now = os_gettime_ns();
+		if (now - trickleLastLogNs >= (uint64_t)trickleCfg.logIntervalSec * 1000000000ULL) {
+			trickleLastLogNs = now;
+			LOG(LOG_INFO, "[trickle] level %.2f ms (raw %.2f ms) target %.1f ms inserted %llu dropped %llu",
+			    trickleLevel / 48.0, (double)buffered / 48.0, trickleCfg.targetMs,
+			    (unsigned long long)trickleInserted, (unsigned long long)trickleDropped);
+		}
+	}
 }
 
 #define TIME_BASE 1000000000

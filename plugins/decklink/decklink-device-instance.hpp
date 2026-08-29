@@ -166,6 +166,27 @@ protected:
 	BMDTimeScale totalFramesScheduled;
 	ComPtr<RenderDelegate<DeckLinkDeviceInstance>> renderDelegate;
 
+	/* Audio buffer trickle steering (custom patch, not upstream).
+	 * Holds the driver's buffered-audio level at a fixed target by
+	 * inserting/dropping single sample frames, instead of letting the
+	 * driver drift ~80ms and snap back (PC vs card clock drift). */
+	struct TrickleConfig {
+		bool enabled = true;
+		double targetMs = 100.0;
+		double deadbandMs = 2.0;
+		int maxCorrectionSamples = 1;
+		double emaAlpha = 0.05;
+		int logIntervalSec = 60;
+	};
+	TrickleConfig trickleCfg;
+	double trickleLevel = -1.0;
+	uint64_t trickleInserted = 0;
+	uint64_t trickleDropped = 0;
+	uint64_t trickleLastLogNs = 0;
+	bool tricklePrimed = false;
+
+	void LoadTrickleConfig();
+
 	void FinalizeStream();
 	void SetupVideoFormat(DeckLinkDeviceMode *mode_);
 
